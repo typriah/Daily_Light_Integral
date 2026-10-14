@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+
+import socket
+import MySQLdb
+import threading
+import re
+from datetime import datetime
+
+DB_HOST = "localhost"
+DB_USER = "root"
+DB_PASS = ""
+DB_NAME = "dlidb"
+
+HOST = "0.0.0.0"
+PORT = 12345
+
+
+def get_db_connection():
+    return MySQLdb.connect(DB_HOST, DB_USER, DB_PASS, DB_NAME)
+
+
+def ensure_rgbw_columns():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    columns_to_add = [
+        ("red_pct",   "TINYINT UNSIGNED DEFAULT NULL COMMENT 'Proporsi Red LED (0-100)'"),
+        ("green_pct", "TINYINT UNSIGNED DEFAULT NULL COMMENT 'Proporsi Green LED (0-100)'"),
+        ("blue_pct",  "TINYINT UNSIGNED DEFAULT NULL COMMENT 'Proporsi Blue LED (0-100)'"),
+        ("white_pct", "TINYINT UNSIGNED DEFAULT NULL COMMENT 'Proporsi White LED (0-100)'"),
+    ]
+
+    cursor.execute("SHOW COLUMNS FROM light_monitoring")
+    existing = {row[0] for row in cursor.fetchall()}
+
+    for col_name, col_def in columns_to_add:
+        if col_name not in existing:
+            sql = f"ALTER TABLE light_monitoring ADD COLUMN {col_name} {col_def}"
+            cursor.execute(sql)
+            print(f"[DB] Kolom '{col_name}' ditambahkan ke light_monitoring")
+        else:
+            print(f"[DB] Kolom '{col_name}' sudah ada, dilewati")
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def get_last_dli_today(date_str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT dli_daily FROM light_monitoring WHERE DATE(timestamp)=%s ORDER BY timestamp DESC LIMIT 1",
+        (date_str,)
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return float(row[0]) if row else 0.0
+
+
+_RGBW_PATTERN = re.compile(
+    r'R(?P<r>\d{1,3})G(?P<g>\d{1,3})B(?P<b>\d{1,3})W(?P<w>\d{1,3})',
+    re.IGNORECASE
+)
+
+
+def parse_rgbw_from_source(source: str):
+    match = _RGBW_PATTERN.search(source)
+    if not match:
+        return None
+    return {
+        'r': min(100, int(match.group('r'))),
+        'g': min(100, int(match.group('g'))),
+        'b': min(100, int(match.group('b'))),
+        'w': min(100, int(match.group('w'))),
+    }
+
+
+def simpan_data(parts):
+    if len(parts) < 8:
+        print(f"Data tidak lengkap: {parts}")
+        return
+    try:
+        lux         = float(parts[0])
+        ppfd        = float(parts[1])
+        brightness  = int(parts[3])
+        interval    = int(parts[4])
+        temperature = float(parts[5]) if parts[5] else None
+        humidity    = float(parts[6]) if parts[6] else None
+        source      = parts[7].strip()
+    except Exception as e:
+        print(f"Error parsing data: {e} | {parts}")
+        return
+
+    rgbw = parse_rgbw_from_source(source)
+    red_pct   = rgbw['r'] if rgbw else None
+    green_pct = rgbw['g'] if rgbw else None
+    blue_pct  = rgbw['b'] if rgbw else None
+    white_pct = rgbw['w'] if rgbw else None
+
+    dli_contrib  = ppfd * interval / 1_000_000.0
+    today        = datetime.now().date()
+    last_dli     = get_last_dli_today(today)
+    new_dli_daily = last_dli + dli_contrib
+
+    conn   = get_db_connection()
+    cursor = conn.cursor()
+
+    sql = """
+        INSERT INTO light_monitoring
+            (timestamp, lux, ppfd, dli_cumulative, dli_daily, led_brightness,
+             sampling_interval_sec, temperature, humidity, sensor_status,
+             red_pct, green_pct, blue_pct, white_pct)
+        VALUES
+            (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s,
+             %s, %s, %s, %s)
+    """
+    cursor.execute(sql, (
+        lux, ppfd, new_dli_daily, new_dli_daily, brightness,
+        interval, temperature, humidity, source,
+        red_pct, green_pct, blue_pct, white_pct
+    ))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    rgbw_str = (
+        f"R={red_pct}% G={green_pct}% B={blue_pct}% W={white_pct}%"
+        if rgbw else "RGBW=n/a"
+    )
+    print(
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+        f"{source}: Lux={lux:.1f}, PPFD={ppfd:.2f}, "
+        f"DLI_harian={new_dli_daily:.4f} mol/m² | {rgbw_str}"
+    )
+
+
+def handle_client(conn, addr):
+    print(f"Terhubung dari {addr}")
+    buffer = ""
+    while True:
+        try:
+            data = conn.recv(1024).decode('utf-8')
+            if not data:
+                break
+            buffer += data
+            if "\n" in buffer:
+                lines = buffer.split("\n")
+                for line in lines[:-1]:
+                    line = line.strip()
+                    if line:
+                        parts = line.split(",")
+                        if len(parts) == 8:
+                            simpan_data(parts)
+                        else:
+                            print(f"Format salah (jumlah kolom {len(parts)}): {line}")
+                buffer = lines[-1]
+        except Exception as e:
+            print(f"Koneksi error: {e}")
+            break
+    conn.close()
+
+
+def main():
+    print("[DB] Memeriksa & mempersiapkan kolom RGBW...")
+    ensure_rgbw_columns()
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(5)
+    print(f"Server berjalan di {HOST}:{PORT}")
+
+    while True:
+        conn, addr = server.accept()
+        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()
